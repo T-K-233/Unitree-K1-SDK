@@ -9,8 +9,14 @@ import serial
 import numpy as np
 
 
+HALF_TURN_DEGREE = 180
+
+
+
 DEFAULT_BAUDRATE = 1_000_000
-DEFAULT_TIMEOUT = 1.0           # seconds
+DEFAULT_TIMEOUT = 2           # seconds
+
+MOTOR_RESOLUTION = 4096
 
 
 # Message start and end identifier specified in the UART protocol
@@ -25,7 +31,8 @@ MSG_END = b"\x7D"
 GRIPPER_CLOSE_VALUE: int = 1250
 GRIPPER_OPEN_VALUE: int = 0
 
-JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_roll", "wrist_flex", "gripper_roll", "gripper_open"]
+# JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_roll", "wrist_flex", "gripper_roll", "gripper_open"]
+JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "gripper_roll", "gripper_open"]
 
 ZERO_POSE = np.array([
     0., 0., 0., 0., 0., 0., 0.
@@ -126,7 +133,7 @@ class UnitreeK1Robot:
         print("[K1] <RxThread> receive handler started")
         while self.is_connected:
             self.parse_datagram()
-            # print("[K1] <RxThread> thread received datagram")
+            print("[K1] <RxThread> thread received datagram")
     
     def start_receive_thread(self):
         self.update_thread = threading.Thread(target=self.receive_handler, daemon=True)
@@ -332,14 +339,17 @@ class UnitreeK1Robot:
         if data_name == "Torque_Enable":
             return np.array([1 if self.is_enabled else 0] * 7)
         elif data_name == "Present_Position":
-            # self.update()
-            position_deg = self.joint_position_measured * 180.0 / np.pi
-            return position_deg.astype(np.int32)
+            # convert from radians to the raw encoder counts, 4096 counts per full rotation
+            values = self.joint_position_measured * MOTOR_RESOLUTION / (2 * np.pi)
         elif data_name == "Goal_Position":
-            position_deg = self.joint_position_target * 180.0 / np.pi
-            return position_deg.astype(np.int32)
+            values = self.joint_position_target * MOTOR_RESOLUTION / (2 * np.pi)
         else:
             raise ValueError(f"Unknown data name: {data_name}")
+    
+        if self.calibration is not None:
+            values = self.apply_calibration_autocorrect(values)
+        
+        return values
         
     def write(self, data_name: str, values: int | float | np.ndarray, motor_names: str | list[str] | None = None) -> None:
         if data_name == "Torque_Enable":
@@ -351,9 +361,20 @@ class UnitreeK1Robot:
                 print("[K1] disabling torque")
                 self.disable()
                 time.sleep(0.02)  # delay some time to make sure the robot is disabled
+            return
         elif data_name == "Goal_Position":
-            self.joint_position_target[:] = values * np.pi / 1800.0
+            if self.calibration is not None:
+                values = self.revert_calibration(values)
+            values = values * (2 * np.pi) / MOTOR_RESOLUTION
+            self.joint_position_target[0] = values[0]
+            self.joint_position_target[1] = values[1]
+            self.joint_position_target[2] = values[2]
+            self.joint_position_target[3] = 0.0
+            self.joint_position_target[4] = values[3]
+            self.joint_position_target[5] = values[4]
+            self.joint_position_target[6] = values[5] - 0.25 * np.pi
             self.send_joint_position_target()
+            return
         elif data_name == "Operating_Mode":
             print("[K1] operating mode:", values)
             pass
@@ -373,3 +394,69 @@ class UnitreeK1Robot:
         print("setting calibration:")
         print(calibration)
         self.calibration = calibration
+    
+    def apply_calibration_autocorrect(self, values: np.ndarray, motor_names: list[str] | None = None) -> np.ndarray:
+        values = self.apply_calibration(values, motor_names)
+        return values
+
+    def apply_calibration(self, values: np.ndarray, motor_names: list[str] | None = None) -> np.ndarray:
+        values = values.astype(np.float32)
+
+        if motor_names is None:
+            motor_names = self.motor_names
+
+        for i, name in enumerate(motor_names):
+            calib_idx = self.calibration["motor_names"].index(name)
+            calib_mode = self.calibration["calib_mode"][calib_idx]
+
+
+            drive_mode = self.calibration["drive_mode"][calib_idx]
+            homing_offset = self.calibration["homing_offset"][calib_idx]
+            resolution = MOTOR_RESOLUTION
+            
+            # Update direction of rotation of the motor to match between leader and follower.
+            # In fact, the motor of the leader for a given joint can be assembled in an
+            # opposite direction in term of rotation than the motor of the follower on the same joint.
+            if drive_mode:
+                values[i] *= -1
+
+            # Convert from range [-2**31, 2**31] to
+            # nominal range [-resolution//2, resolution//2] (e.g. [-2048, 2048])
+            values[i] += homing_offset
+
+            # Convert from range [-resolution//2, resolution//2] to
+            # universal float32 centered degree range [-180, 180]
+            # (e.g. 2048 / (4096 // 2) * 180 = 180)
+            values[i] = values[i] / (resolution // 2) * HALF_TURN_DEGREE
+
+
+        return values
+
+    def revert_calibration(self, values: np.ndarray, motor_names: list[str] | None = None) -> np.ndarray:
+        if motor_names is None:
+            motor_names = self.motor_names
+
+        for i, name in enumerate(motor_names):
+            calib_idx = self.calibration["motor_names"].index(name)
+            calib_mode = self.calibration["calib_mode"][calib_idx]
+
+
+            drive_mode = self.calibration["drive_mode"][calib_idx]
+            homing_offset = self.calibration["homing_offset"][calib_idx]
+            resolution = MOTOR_RESOLUTION
+
+            # Convert from nominal 0-centered degree range [-180, 180] to
+            # 0-centered resolution range (e.g. [-2048, 2048] for resolution=4096)
+            values[i] = values[i] / HALF_TURN_DEGREE * (resolution // 2)
+
+            # Substract the homing offsets to come back to actual motor range of values
+            # which can be arbitrary.
+            values[i] -= homing_offset
+
+            # Remove drive mode, which is the rotation direction of the motor, to come back to
+            # actual motor rotation direction which can be arbitrary.
+            if drive_mode:
+                values[i] *= -1
+
+        values = np.round(values).astype(np.int32)
+        return values
