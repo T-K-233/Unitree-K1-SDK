@@ -1,5 +1,6 @@
 import io
 import time
+import threading
 import struct
 import math
 
@@ -82,9 +83,13 @@ class UnitreeK1Robot:
         self.is_connected = False
         self.is_enabled = False
         self.logs = {}
+        self.update_thread = None
 
         self.joint_position_measured = np.zeros(7)
         self.joint_position_target = np.zeros(7)
+
+        self.calibration = None
+
     
     def connect(self):
         """
@@ -96,6 +101,8 @@ class UnitreeK1Robot:
         self.port_handler = serial.Serial(self.port, self.baudrate, timeout=DEFAULT_TIMEOUT)
         # self.packet_handler
         self.is_connected = True
+
+        self.start_receive_thread()
     
     def disconnect(self):
         """
@@ -103,9 +110,10 @@ class UnitreeK1Robot:
         """
         if not self.is_connected:
             raise RuntimeError("This robot device is not connected. Do not call `robot.disconnect()` twice.")
-        self.port_handler.close()
         self.is_connected = False
-
+        self.update_thread.join()
+        self.port_handler.close()
+        
     def reconnect(self):
         """
         Reconnect to the robot with the latest settings
@@ -113,8 +121,21 @@ class UnitreeK1Robot:
         if self.is_connected:
             self.disconnect()
         self.connect()
+        
+    def receive_handler(self):
+        print("[K1] <RxThread> receive handler started")
+        while self.is_connected:
+            self.parse_datagram()
+            # print("[K1] <RxThread> thread received datagram")
+    
+    def start_receive_thread(self):
+        self.update_thread = threading.Thread(target=self.receive_handler, daemon=True)
+        self.update_thread.start()
 
-    def parse_response(self):
+        # wait for at least one datagram to be received
+        time.sleep(0.1)
+
+    def parse_datagram(self):
         msg_start = self.port_handler.read(2)
         n_bytes = self.port_handler.read(1)[0]
         message = self.port_handler.read(n_bytes)
@@ -166,7 +187,6 @@ class UnitreeK1Robot:
                 # servo_state.voltage = mFrameBuffer[10];
                 # servo_state.current = mFrameBuffer[11]|(mFrameBuffer[12]<<8);
                 # servo_state.flag = 1;
-                
         else:
             print("unknown command")
             print(message)
@@ -261,10 +281,8 @@ class UnitreeK1Robot:
         
         self.send_message(message)
     
-
     def update(self):
-        self.parse_response()
-
+        self.parse_datagram()
 
     def send_joint_position_target(self):
         """
@@ -282,9 +300,7 @@ class UnitreeK1Robot:
         self.set_gripper_rad(self.joint_position_target[6])
 
     def step(self, actions: np.ndarray):
-        self.parse_response()
         self.joint_position_target[:] = actions
-
         self.send_joint_position_target()
         
 
@@ -306,7 +322,7 @@ class UnitreeK1Robot:
     
     @property
     def motor_models(self) -> list[str]:
-        return ["K1 Servo"] * 7
+        return ["x_series"] * 7
     
     @property
     def motor_indices(self) -> list[int]:
@@ -314,20 +330,46 @@ class UnitreeK1Robot:
     
     def read(self, data_name: str, motor_names: str | list[str] | None = None) -> np.ndarray:
         if data_name == "Torque_Enable":
-            return self.is_enabled
+            return np.array([1 if self.is_enabled else 0] * 7)
         elif data_name == "Present_Position":
-            return self.joint_position_measured
+            # self.update()
+            position_deg = self.joint_position_measured * 180.0 / np.pi
+            return position_deg.astype(np.int32)
         elif data_name == "Goal_Position":
-            return self.joint_position_target
+            position_deg = self.joint_position_target * 180.0 / np.pi
+            return position_deg.astype(np.int32)
         else:
             raise ValueError(f"Unknown data name: {data_name}")
         
     def write(self, data_name: str, values: int | float | np.ndarray, motor_names: str | list[str] | None = None) -> None:
         if data_name == "Torque_Enable":
-            self.enable()
+            if values:
+                print("[K1] enabling torque")
+                self.enable()
+                time.sleep(0.02)  # delay some time to make sure the robot is enabled
+            else:
+                print("[K1] disabling torque")
+                self.disable()
+                time.sleep(0.02)  # delay some time to make sure the robot is disabled
         elif data_name == "Goal_Position":
-            self.joint_position_target[:] = values
+            self.joint_position_target[:] = values * np.pi / 1800.0
             self.send_joint_position_target()
+        elif data_name == "Operating_Mode":
+            print("[K1] operating mode:", values)
+            pass
+        elif data_name == "Position_P_Gain":
+            print("[K1] position p gain:", values)
+            pass
+        elif data_name == "Position_D_Gain":
+            print("[K1] position d gain:", values)
+            pass
+        elif data_name == "Position_I_Gain":
+            print("[K1] position i gain:", values)
+            pass
         else:
             raise ValueError(f"Unknown data name: {data_name}")
 
+    def set_calibration(self, calibration: dict[str, list]):
+        print("setting calibration:")
+        print(calibration)
+        self.calibration = calibration
