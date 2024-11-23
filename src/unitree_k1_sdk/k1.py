@@ -133,7 +133,7 @@ class UnitreeK1Robot:
         print("[K1] <RxThread> receive handler started")
         while self.is_connected:
             self.parse_datagram()
-            print("[K1] <RxThread> thread received datagram")
+            # print("[K1] <RxThread> thread received datagram")
     
     def start_receive_thread(self):
         self.update_thread = threading.Thread(target=self.receive_handler, daemon=True)
