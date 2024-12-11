@@ -32,14 +32,14 @@ GRIPPER_CLOSE_VALUE: int = 1250
 GRIPPER_OPEN_VALUE: int = 0
 
 # JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_roll", "wrist_flex", "gripper_roll", "gripper_open"]
-JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "gripper_roll", "gripper_open"]
+JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_roll", "wrist_flex", "gripper_roll", "gripper"]
 
 ZERO_POSE = np.array([
     0., 0., 0., 0., 0., 0., 0.
 ])
 
 IDLE_POSE = np.array([
-    0., 0.49 * np.pi, -0.5 * np.pi, 0.0, -0.1 * np.pi, 0.0, 0
+    0, 0, 0, 0.0, 0.0, 0.0, 0
 ])
 
 class Message:
@@ -229,18 +229,18 @@ class UnitreeK1Robot:
         self._set_arm_locked(False)
         self.is_enabled = False
     
-    def _set_gripper_raw(self, open: bool, value: int):
+    def _set_gripper_raw(self, is_open: bool, value: int):
         """
         int CSDarmCommonSerial::SendArmEndAction(unsigned char onoff, short value)
         """
-        open = 1 if open else 0
+        is_open = 1 if is_open else 0
         # clip actuator range
         value = max(GRIPPER_OPEN_VALUE, min(value, GRIPPER_CLOSE_VALUE))
 
         message = struct.pack("<BBBH",
                               Message.TYPE_REQUEST_MESSAGE,
                               Command.CMD_CONTROL_END_ACTION,
-                              open,
+                              is_open,
                               value)
         self.send_message(message)
     
@@ -251,9 +251,11 @@ class UnitreeK1Robot:
         Args:
             value (float): The gripper open state. 1.0 is fully open, 0.0 is fully closed.
         """
+        is_open = value > 0.5
         value = GRIPPER_OPEN_VALUE + ((1 - value) * (GRIPPER_CLOSE_VALUE - GRIPPER_OPEN_VALUE))
         value = int(value)
-        self._set_gripper_raw(False, value)
+        
+        self._set_gripper_raw(is_open, value)
     
     def set_gripper_rad(self, rad: float):
         """
@@ -369,10 +371,10 @@ class UnitreeK1Robot:
             self.joint_position_target[0] = values[0]
             self.joint_position_target[1] = values[1]
             self.joint_position_target[2] = values[2]
-            self.joint_position_target[3] = 0.0
-            self.joint_position_target[4] = values[3]
-            self.joint_position_target[5] = values[4]
-            self.joint_position_target[6] = values[5] - 0.25 * np.pi
+            self.joint_position_target[3] = values[3]
+            self.joint_position_target[4] = values[4]
+            self.joint_position_target[5] = values[5]
+            self.joint_position_target[6] = values[6] - 0.2 * np.pi    # offset to make the gripper open
             self.send_joint_position_target()
             return
         elif data_name == "Operating_Mode":
@@ -408,7 +410,6 @@ class UnitreeK1Robot:
         for i, name in enumerate(motor_names):
             calib_idx = self.calibration["motor_names"].index(name)
             calib_mode = self.calibration["calib_mode"][calib_idx]
-
 
             drive_mode = self.calibration["drive_mode"][calib_idx]
             homing_offset = self.calibration["homing_offset"][calib_idx]
